@@ -252,12 +252,30 @@ class v8DetectionDistillLoss(v8DetectionLoss):
         super().__init__(model)
         self.distil_gain = distil_gain 
         self.region_factor = region_factor
-    
+
+    def preprocess(self, targets, batch_size, scale_tensor, shrink_factor = 1):
+        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 5, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 5, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
+            # Shrink or expand gt boxes with shrink_factor
+            out[..., 3:5] *= shrink_factor
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        return out
+
+
+
     def __call__(self, preds, batch, embed_teacher=None, embed_student=None):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        #if self.distitlation and (embed_teacher is None or embed_student is None):
-        #    raise TypeError("You've choosen distilation training but there is no feature output in models")
-        #if self.distitlation:
         loss = torch.zeros(4, device=self.device)  # box, cls, dfl, distil
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
