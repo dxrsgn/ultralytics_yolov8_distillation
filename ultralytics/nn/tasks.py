@@ -52,7 +52,7 @@ from ultralytics.nn.modules import (
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss
+from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v8DetectionDistillLoss
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (
     fuse_conv_and_bn,
@@ -278,7 +278,6 @@ class DetectionModel(BaseModel):
         """Initialize the YOLOv8 detection model with the given config and parameters."""
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
-
         # Define model
         ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels
         if nc and nc != self.yaml["nc"]:
@@ -305,7 +304,6 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
-
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference and train outputs."""
         img_size = x.shape[-2:]  # height, width
@@ -346,7 +344,96 @@ class DetectionModel(BaseModel):
         """Initialize the loss criterion for the DetectionModel."""
         return v8DetectionLoss(self)
 
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None, unflatten_embed = False):
+        """
+        Perform a forward pass through the network.
 
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+            augment (bool): Augment image during prediction, defaults to False.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        if augment:
+            return self._predict_augment(x)
+        return self._predict_once(x, profile, visualize, embed, unflatten_embed)
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None, unflatten_embed = False):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        y, dt, embeddings = [], [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                # Get unflattened features
+                if unflatten_embed:
+                    embeddings.append(x)
+                    if m.i == max(embed):
+                        return torch.cat(embeddings, 1)
+                else:
+                    embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                    if m.i == max(embed):
+                        return torch.unbind(torch.cat(embeddings, 1), dim=0)
+
+        return x
+
+
+
+class DetectionDistillModel(DetectionModel):
+    """YOLOv8 detection model."""
+
+    def __init__(self,
+            cfg="yolov8n.yaml",
+            ch=3,
+            nc=None,
+            verbose=True,
+            distil_gain = 0.1,
+            imit_region_factor = 0.5
+        ):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self.distilation = True
+        self.distil_gain = distil_gain
+        self.region_factor = imit_region_factor
+    
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        return v8DetectionDistillLoss(self, distil_gain=self.distil_gain)
+    
+    def loss(self, batch, preds=None, embed_teacher = None, embed_student = None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on
+            preds (torch.Tensor | List[torch.Tensor]): Predictions.
+        """
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        preds = self.forward(batch["img"]) if preds is None else preds
+        return self.criterion(preds, batch, embed_student=embed_student, embed_teacher=embed_teacher)
+    
 class OBBModel(DetectionModel):
     """YOLOv8 Oriented Bounding Box (OBB) model."""
 

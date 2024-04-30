@@ -226,7 +226,6 @@ class BaseTrainer:
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
         self.set_model_attributes()
-
         # Freeze layers
         freeze_list = (
             self.args.freeze

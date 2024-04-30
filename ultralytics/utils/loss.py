@@ -247,6 +247,87 @@ class v8DetectionLoss:
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
+class v8DetectionDistillLoss(v8DetectionLoss):
+    def __init__(self, model, distil_gain=0.5, region_factor = 0.5):
+        super().__init__(model)
+        self.distil_gain = distil_gain 
+        self.region_factor = region_factor
+    
+    def __call__(self, preds, batch, embed_teacher=None, embed_student=None):
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        #if self.distitlation and (embed_teacher is None or embed_student is None):
+        #    raise TypeError("You've choosen distilation training but there is no feature output in models")
+        #if self.distitlation:
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, distil
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        feature_targets = self.preprocess(
+            targets.to(self.device),
+            batch_size,
+            scale_tensor=torch.tensor(embed_teacher.shape, device=self.device)[[3,2,3,2]]
+        )
+        _, feature_gt_boxes = feature_targets.split((1,4),2)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Imitation mask
+        mask = torch.zeros((embed_teacher.shape), dtype=torch.bool, device=self.device)
+        for i in range(batch_size):
+            mask_img = torch.zeros((embed_teacher.shape[-2], embed_teacher.shape[-1]), dtype=torch.bool, device=self.device)
+            for j in range(feature_gt_boxes[i].shape[0]):
+                if not torch.any(feature_gt_boxes[i, j]):
+                    continue
+                xmin, ymin, xmax, ymax = map(int, feature_gt_boxes[i, j])
+                mask_img[ymin:ymax, xmin:xmax] = 1
+            mask[i, :] = mask_img.unsqueeze(0).repeat(mask.shape[1], 1, 1)
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+        # Kd loss
+        embed_diff = torch.pow(embed_student - embed_teacher, 2) * mask
+        embed_diff = embed_diff.sum() / mask.sum() / 2
+        loss[3] = embed_diff*self.distil_gain # distill
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses."""
