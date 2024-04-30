@@ -407,14 +407,11 @@ class DetectionDistillModel(DetectionModel):
             cfg="yolov8n.yaml",
             ch=3,
             nc=None,
-            verbose=True,
-            distil_gain = 0.1,
-            imit_region_factor = 0.5
+            verbose=True
         ):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        self.distilation = True
-        self.distil_gain = distil_gain
-        self.region_factor = imit_region_factor
+        self.distil_gain = self.yaml["distill_gain"]
+        self.region_factor = self.yaml["region_factor"]
     
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
