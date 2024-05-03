@@ -253,7 +253,7 @@ class v8DetectionDistillLoss(v8DetectionLoss):
         self.distil_gain = distil_gain 
         self.region_factor = region_factor
 
-    def preprocess(self, targets, batch_size, scale_tensor, shrink_factor = 1):
+    def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 5, device=self.device)
@@ -268,11 +268,41 @@ class v8DetectionDistillLoss(v8DetectionLoss):
                 if n:
                     out[j, :n] = targets[matches, 1:]
             # Shrink or expand gt boxes with shrink_factor
-            out[..., 3:5] *= shrink_factor
+            out[..., 3:5] *= self.region_factor
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 
+    def create_mask(self, targets, batch_size, embed_teacher):
+        masks = []
+        for emb_t in embed_teacher:
+            _, _, w, h = emb_t.shape
+            feature_targets = self.preprocess(
+                targets.to(self.device),
+                batch_size,
+                scale_tensor=torch.tensor([h, w, h, w], device=self.device)
+            )
+            _, feature_gt_boxes = feature_targets.split((1,4),2)
+            # Imitation mask
+            mask = torch.zeros_like(emb_t, dtype=torch.bool, device=self.device)
+            for i in range(batch_size):
+                mask_img = torch.zeros((emb_t.shape[-2], emb_t.shape[-1]), dtype=torch.bool, device=self.device)
+                for j in range(feature_gt_boxes[i].shape[0]):
+                    if not torch.any(feature_gt_boxes[i, j]):
+                        continue
+                    xmin, ymin, xmax, ymax = map(int, feature_gt_boxes[i, j])
+                    mask_img[ymin:ymax, xmin:xmax] = 1
+                mask[i, :] = mask_img.unsqueeze(0).repeat(mask.shape[1], 1, 1)
+            masks.append(mask)
+        return masks
 
+    def imitation_loss(self, embed_teacher, embed_students, masks):
+        loss = 0
+        for emb_t, emb_s, mask in zip(embed_teacher, embed_students, masks):
+            embed_diff = torch.pow(emb_s - emb_t, 2) * mask
+            embed_diff = embed_diff.sum() / mask.sum() / 2
+            loss += embed_diff
+        loss /= len(masks)
+        return loss
 
     def __call__(self, preds, batch, embed_teacher=None, embed_student=None):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
@@ -292,12 +322,8 @@ class v8DetectionDistillLoss(v8DetectionLoss):
 
         # Targets
         targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        feature_targets = self.preprocess(
-            targets.to(self.device),
-            batch_size,
-            scale_tensor=torch.tensor(embed_teacher.shape, device=self.device)[[3,2,3,2]]
-        )
-        _, feature_gt_boxes = feature_targets.split((1,4),2)
+        # Imitation masks
+        masks = self.create_mask(targets, batch_size, embed_teacher)
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
@@ -316,16 +342,6 @@ class v8DetectionDistillLoss(v8DetectionLoss):
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Imitation mask
-        mask = torch.zeros((embed_teacher.shape), dtype=torch.bool, device=self.device)
-        for i in range(batch_size):
-            mask_img = torch.zeros((embed_teacher.shape[-2], embed_teacher.shape[-1]), dtype=torch.bool, device=self.device)
-            for j in range(feature_gt_boxes[i].shape[0]):
-                if not torch.any(feature_gt_boxes[i, j]):
-                    continue
-                xmin, ymin, xmax, ymax = map(int, feature_gt_boxes[i, j])
-                mask_img[ymin:ymax, xmin:xmax] = 1
-            mask[i, :] = mask_img.unsqueeze(0).repeat(mask.shape[1], 1, 1)
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
@@ -336,16 +352,14 @@ class v8DetectionDistillLoss(v8DetectionLoss):
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
-        # Kd loss
-        embed_diff = torch.pow(embed_student - embed_teacher, 2) * mask
-        embed_diff = embed_diff.sum() / mask.sum() / 2
-        loss[3] = embed_diff*self.distil_gain # distill
+        loss[3] = self.imitation_loss(embed_teacher, embed_student, masks)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.distil_gain # distill
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, distill)
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses."""

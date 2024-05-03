@@ -327,9 +327,7 @@ class DetectionDistillValidator(DetectionValidator):
     def __init__(
             self,
             teacher = None,
-            projection= None,
-            embeds_s= None,
-            embeds_t= None,
+            feat_adapts = None,
             dataloader=None,
             save_dir=None,
             pbar=None,
@@ -339,10 +337,8 @@ class DetectionDistillValidator(DetectionValidator):
 
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
         self.teacher = teacher
-        self.projection = projection
-        self.embeds_s = embeds_s
-        self.embeds_t = embeds_t
-        
+        self.feat_adapts = feat_adapts
+ 
     @smart_inference_mode()
     def __call__(self, trainer=None, model=None, teacher = None, feature_projection = None):
         """Supports validation of a pre-trained model if passed or a model being trained if trainer is passed (trainer
@@ -357,7 +353,8 @@ class DetectionDistillValidator(DetectionValidator):
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
             self.teacher = self.teacher.half() if self.args.half else self.teacher.float()
-            self.projection = self.projection.half() if self.args.half else self.projection.float()
+            for i, adapt in enumerate(self.feat_adapts):
+                self.feat_adapts[i] = adapt.half() if self.args.half else adapt.float()
             # self.model = model
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
@@ -425,8 +422,10 @@ class DetectionDistillValidator(DetectionValidator):
                 if self.training:
                     emb_t = self.teacher.predict(batch['img'], embed = self.embeds_t, unflatten_embed = True)
                     emb_s = model.predict(batch['img'], embed = self.embeds_s, unflatten_embed = True)
-                    emb_s = self.projection(emb_s)
-                    self.loss += model.loss(batch, preds, embed_teacher = emb_t, embed_student = emb_s)[1]
+                    emb_s_adapted = []
+                    for emb_adpt, emb in zip(self.feature_adapts, emb_s):
+                        emb_s_adapted.append(emb_adpt(emb))
+                    self.loss += model.loss(batch, preds, embed_teacher = emb_t, embed_student = emb_s_adapted)[1]
 
             # Postprocess
             with dt[3]:

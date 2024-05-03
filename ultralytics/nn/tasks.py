@@ -390,7 +390,7 @@ class DetectionModel(BaseModel):
                 if unflatten_embed:
                     embeddings.append(x)
                     if m.i == max(embed):
-                        return torch.cat(embeddings, 1)
+                        return embeddings 
                 else:
                     embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                     if m.i == max(embed):
@@ -415,7 +415,7 @@ class DetectionDistillModel(DetectionModel):
     
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return v8DetectionDistillLoss(self, distil_gain=self.distil_gain)
+        return v8DetectionDistillLoss(self, distil_gain=self.distil_gain, region_factor=self.region_factor)
     
     def loss(self, batch, preds=None, embed_teacher = None, embed_student = None):
         """

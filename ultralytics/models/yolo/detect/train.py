@@ -276,7 +276,7 @@ class DistilationDetectionTrainer(DetectionTrainer):
     def get_validator(self):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss", "dist_loss"
         return yolo.detect.DetectionDistillValidator(
-            self.teacher, self.projection, self.embeds_s, self.embeds_t,
+            self.teacher, self.feature_adapts,
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
     
@@ -285,18 +285,19 @@ class DistilationDetectionTrainer(DetectionTrainer):
             self.embeds_s = [len(self.model.model) - 2]
         if not self.embeds_t:
             self.embeds_t = [len(self.teacher.model) - 2]
-
         imgsz = self.args.__getattribute__("imgsz")
         img = torch.zeros((1, 3, imgsz, imgsz), device=self.device)
-        teacher_feature = self.teacher.predict(img, embed = self.embeds_t, unflatten_embed = True)[0]
-        student_feature = self.model.predict(img, embed = self.embeds_s, unflatten_embed = True)[0]
-        student_channel, student_out_size, _ = student_feature.shape
-        teacher_channel, teacher_out_size, _ = teacher_feature.shape
-        self.projection = nn.Sequential(
-                nn.Conv2d(student_channel, teacher_channel, 3, padding=1, stride=int(student_out_size / teacher_out_size)), 
-                nn.ReLU() 
-        )
-        self.projection = self.projection.to(self.device)
+        teacher_feature = self.teacher.predict(img, embed = self.embeds_t, unflatten_embed = True)
+        student_feature = self.model.predict(img, embed = self.embeds_s, unflatten_embed = True)
+        self.feature_adapts = []
+        for stu_feat, tea_feat in zip(student_feature, teacher_feature):
+            _, student_channel, student_out_size, _ = stu_feat.shape
+            _, teacher_channel, teacher_out_size, _ = tea_feat.shape
+            self.feature_adapts.append(nn.Sequential(
+                    nn.Conv2d(student_channel, teacher_channel, 3, padding=1, stride=int(student_out_size / teacher_out_size)), 
+                    nn.ReLU() 
+            ).to(self.device))
+
 
 
     def get_model(self, cfg=None, weights=None, verbose=True):
@@ -370,10 +371,10 @@ class DistilationDetectionTrainer(DetectionTrainer):
                     batch = self.preprocess_batch(batch)
                     emb_t = self.teacher.predict(batch['img'], embed = self.embeds_t, unflatten_embed = True)
                     emb_s = self.model.predict(batch['img'], embed = self.embeds_s, unflatten_embed = True)
-                    # Base model's preditct unbind embedding tensor
-                    # so cast it back
-                    emb_s = self.projection(emb_s)
-                    self.loss, self.loss_items = self.model(batch, embed_teacher = emb_t, embed_student = emb_s)
+                    emb_s_adapted = []
+                    for emb_adpt, emb in zip(self.feature_adapts, emb_s):
+                        emb_s_adapted.append(emb_adpt(emb))
+                    self.loss, self.loss_items = self.model(batch, embed_teacher = emb_t, embed_student = emb_s_adapted)
                     if RANK != -1:
                         self.loss *= world_size
                     self.tloss = (
